@@ -1,12 +1,11 @@
 /**
  * Layout preset initialization for multi-resolution support.
  *
- * Three presets are provided:
- *   - 320x240 (M5Stack Basic v2.7)        — 3-column main screen, 5-entry submenus
+ * Four presets are provided:
+ *   - 410x502 (LILYGO T-Watch Ultra)       — 1-column portrait, large buttons
+ *   - 320x240 (M5Stack Basic v2.7)         — 3-column main screen, 5-entry submenus
  *   - 320x170 (Waveshare ESP32-S3-LCD-1.9) — 3-column, compact buttons, no vmode
  *   - 240x135 (M5StickC Plus2)             — 1-column main screen, 3-entry submenus
- *
- * The 240x135 preset is designed but not yet hardware-tested.
  */
 
 #include "ui_layout.h"
@@ -16,6 +15,98 @@
 
 static ui_layout_t s_layout;
 static bool s_initialized = false;
+
+/* ---------------------------------------------------------------------- */
+/* 410 x 502   (LILYGO T-Watch Ultra AMOLED)                              */
+/* ---------------------------------------------------------------------- */
+static void init_layout_410x502(ui_layout_t *L) {
+    L->screen_w = 410;
+    L->screen_h = 502;
+
+    L->font_small   = &lv_font_montserrat_14;
+    L->font_body    = &lv_font_montserrat_16;
+    L->font_heading = &lv_font_montserrat_16;
+    L->icon_size    = 32;
+
+    L->cam.count   = 1;
+    L->cam.x_start = 10;
+    L->cam.y       = 10;
+    L->cam.w       = 390;
+    L->cam.h       = 300;
+    L->cam.spacing = 390;
+
+    L->cam_detail.ind_x  = 1;    L->cam_detail.ind_y  = 1;
+    L->cam_detail.ind_w  = 388;  L->cam_detail.ind_h  = 6;
+
+    L->cam_detail.title_x = 10;  L->cam_detail.title_y = 15;
+    L->cam_detail.title_w = 370;
+
+    L->cam_detail.mode_icon_x = 10;  L->cam_detail.mode_icon_y = 50;
+    L->cam_detail.vmode_x     = 60;  L->cam_detail.vmode_y     = 50;
+    L->cam_detail.vmode_w     = 320;
+    L->cam_detail.vmode_line_space = 2;
+
+    L->cam_detail.status_icon_x = 179;  L->cam_detail.status_icon_y = 110;
+
+    L->cam_detail.time_x = 10;   L->cam_detail.time_y = 160;
+    L->cam_detail.time_w = 390;
+
+    L->cam_detail.sd_icon_x  = 10;   L->cam_detail.sd_icon_y  = 210;
+    L->cam_detail.sd_text_x  = 50;   L->cam_detail.sd_text_y  = 215;
+
+    L->cam_detail.bat_icon_x = 210;  L->cam_detail.bat_icon_y = 210;
+    L->cam_detail.bat_text_x = 250;  L->cam_detail.bat_text_y = 215;
+
+    L->status.notif_x    = 10;   L->status.notif_y    = 325;
+    L->status.notif_w    = 300;
+    L->status.gps_icon_x = 350;  L->status.gps_icon_y = 320;
+    L->status.gps_text_x = 10;   L->status.gps_text_y = 350;
+    L->status.gps_fix_color    = lv_color_make(0, 255, 0);
+    L->status.gps_text_visible = true;
+
+    L->btn.y          = 420;
+    L->btn.w          = 120;
+    L->btn.h          = 60;
+    L->btn.x[0]       = 10;
+    L->btn.x[1]       = 145;
+    L->btn.x[2]       = 280;
+    L->btn.label_ofs_x = 40;
+    L->btn.label_ofs_y = 20;
+
+    L->btn_style.compact     = false;
+    L->btn_style.bg_color[0] = lv_color_black();
+    L->btn_style.bg_color[1] = lv_color_black();
+    L->btn_style.bg_color[2] = lv_color_black();
+    L->btn_style.icon_ofs_x  = 5;
+    L->btn_style.icon_ofs_y  = 10;
+    L->btn_style.icon_size   = 32;
+
+    L->submenu.base_x        = 10;
+    L->submenu.base_y        = 10;
+    L->submenu.w             = 390;
+    L->submenu.title_ofs_y   = 4;
+    L->submenu.entry_h       = 50;
+    L->submenu.entry_first_y = 60;
+    L->submenu.entry_spacing = 55;
+    L->submenu.indicator_w   = 8;
+    L->submenu.icon_ofs_x    = 15;
+    L->submenu.icon_ofs_y    = 10;
+    L->submenu.label_ofs_x   = 55;
+    L->submenu.label_ofs_y   = 14;
+    L->submenu.max_entries   = 6;
+    L->submenu.notif_x       = 10;
+    L->submenu.notif_y       = 450;
+    L->submenu.notif_w       = 390;
+
+    L->submenu_btns.column       = false;
+    L->submenu_btns.col_x        = 0;
+    L->submenu_btns.col_btn_y[0] = 0; L->submenu_btns.col_btn_h[0] = 0;
+    L->submenu_btns.col_btn_y[1] = 0; L->submenu_btns.col_btn_h[1] = 0;
+    L->submenu_btns.col_btn_y[2] = 0; L->submenu_btns.col_btn_h[2] = 0;
+
+    L->mode.icon_ofs_y  = 40;
+    L->mode.label_ofs_y = 90;
+}
 
 /* ---------------------------------------------------------------------- */
 /* 320 x 240   (M5Stack Basic v2.7)                                       */
@@ -29,7 +120,6 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->font_heading = &lv_font_montserrat_16;
     L->icon_size    = 24;
 
-    /* Camera blocks (3 columns, 100px each, contiguous) */
     L->cam.count   = 3;
     L->cam.x_start = 10;
     L->cam.y       = 10;
@@ -37,7 +127,6 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->cam.h       = 178;
     L->cam.spacing = 100;
 
-    /* Camera block internal offsets */
     L->cam_detail.ind_x  = 1;   L->cam_detail.ind_y  = 1;
     L->cam_detail.ind_w  = 97;  L->cam_detail.ind_h  = 4;
 
@@ -61,15 +150,13 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->cam_detail.bat_icon_x = 5;   L->cam_detail.bat_icon_y = 149;
     L->cam_detail.bat_text_x = 34;  L->cam_detail.bat_text_y = 154;
 
-    /* Status bar */
     L->status.notif_x    = 15;   L->status.notif_y    = 197;
     L->status.notif_w    = 140;
     L->status.gps_icon_x = 160;  L->status.gps_icon_y = 192;
     L->status.gps_text_x = 194;  L->status.gps_text_y = 196;
-    L->status.gps_fix_color   = lv_color_make(255, 255, 0);  /* Yellow */
+    L->status.gps_fix_color   = lv_color_make(255, 255, 0);
     L->status.gps_text_visible = true;
 
-    /* Button bar */
     L->btn.y          = 216;
     L->btn.w          = 93;
     L->btn.h          = 24;
@@ -79,7 +166,6 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->btn.label_ofs_x = 29;
     L->btn.label_ofs_y = 5;
 
-    /* Button style — standard wide buttons with labels */
     L->btn_style.compact    = false;
     L->btn_style.bg_color[0] = lv_color_black();
     L->btn_style.bg_color[1] = lv_color_black();
@@ -88,7 +174,6 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->btn_style.icon_ofs_y = 0;
     L->btn_style.icon_size  = 24;
 
-    /* Submenu layout */
     L->submenu.base_x        = 10;
     L->submenu.base_y        = 10;
     L->submenu.w             = 300;
@@ -106,20 +191,18 @@ static void init_layout_320x240(ui_layout_t *L) {
     L->submenu.notif_y       = 189;
     L->submenu.notif_w       = 290;
 
-    /* Submenu buttons — standard bottom bar */
     L->submenu_btns.column      = false;
     L->submenu_btns.col_x       = 0;
     L->submenu_btns.col_btn_y[0] = 0;  L->submenu_btns.col_btn_h[0] = 0;
     L->submenu_btns.col_btn_y[1] = 0;  L->submenu_btns.col_btn_h[1] = 0;
     L->submenu_btns.col_btn_y[2] = 0;  L->submenu_btns.col_btn_h[2] = 0;
 
-    /* Mode switch */
     L->mode.icon_ofs_y  = 29;
     L->mode.label_ofs_y = 68;
 }
 
 /* ---------------------------------------------------------------------- */
-/* 240 x 135   (M5StickC Plus2)  —  untested, needs hardware validation   */
+/* 240 x 135   (M5StickC Plus2)                                           */
 /* ---------------------------------------------------------------------- */
 static void init_layout_240x135(ui_layout_t *L) {
     L->screen_w = 240;
@@ -130,7 +213,6 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->font_heading = &lv_font_montserrat_14;
     L->icon_size    = 24;
 
-    /* Single camera block visible at a time; user cycles with Button B */
     L->cam.count   = 1;
     L->cam.x_start = 10;
     L->cam.y       = 5;
@@ -138,7 +220,6 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->cam.h       = 80;
     L->cam.spacing = 220;
 
-    /* Camera block internals — two-column compact layout */
     L->cam_detail.ind_x  = 1;    L->cam_detail.ind_y  = 1;
     L->cam_detail.ind_w  = 218;  L->cam_detail.ind_h  = 3;
 
@@ -162,15 +243,13 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->cam_detail.bat_icon_x = 120;  L->cam_detail.bat_icon_y = 52;
     L->cam_detail.bat_text_x = 149;  L->cam_detail.bat_text_y = 55;
 
-    /* Status bar */
     L->status.notif_x    = 10;   L->status.notif_y    = 90;
     L->status.notif_w    = 110;
     L->status.gps_icon_x = 120;  L->status.gps_icon_y = 88;
     L->status.gps_text_x = 148;  L->status.gps_text_y = 90;
-    L->status.gps_fix_color   = lv_color_make(255, 255, 0);  /* Yellow */
+    L->status.gps_fix_color   = lv_color_make(255, 255, 0);
     L->status.gps_text_visible = true;
 
-    /* Button bar */
     L->btn.y          = 111;
     L->btn.w          = 73;
     L->btn.h          = 24;
@@ -180,7 +259,6 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->btn.label_ofs_x = 26;
     L->btn.label_ofs_y = 5;
 
-    /* Button style — standard */
     L->btn_style.compact    = false;
     L->btn_style.bg_color[0] = lv_color_black();
     L->btn_style.bg_color[1] = lv_color_black();
@@ -189,7 +267,6 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->btn_style.icon_ofs_y = 0;
     L->btn_style.icon_size  = 24;
 
-    /* Submenu layout */
     L->submenu.base_x        = 5;
     L->submenu.base_y        = 5;
     L->submenu.w             = 230;
@@ -207,14 +284,12 @@ static void init_layout_240x135(ui_layout_t *L) {
     L->submenu.notif_y       = 82;
     L->submenu.notif_w       = 220;
 
-    /* Submenu buttons — standard bottom bar */
     L->submenu_btns.column      = false;
     L->submenu_btns.col_x       = 0;
     L->submenu_btns.col_btn_y[0] = 0;  L->submenu_btns.col_btn_h[0] = 0;
     L->submenu_btns.col_btn_y[1] = 0;  L->submenu_btns.col_btn_h[1] = 0;
     L->submenu_btns.col_btn_y[2] = 0;  L->submenu_btns.col_btn_h[2] = 0;
 
-    /* Mode switch */
     L->mode.icon_ofs_y  = 20;
     L->mode.label_ofs_y = 48;
 }
@@ -231,7 +306,6 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->font_heading = &lv_font_montserrat_16;
     L->icon_size    = 24;
 
-    /* Camera blocks (3 columns) */
     L->cam.count   = 3;
     L->cam.x_start = 5;
     L->cam.y       = 5;
@@ -239,7 +313,6 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->cam.h       = 134;
     L->cam.spacing = 105;
 
-    /* Camera block internal offsets — no mode icon or vmode rows */
     L->cam_detail.ind_x  = 1;   L->cam_detail.ind_y  = 1;
     L->cam_detail.ind_w  = 97;  L->cam_detail.ind_h  = 4;
 
@@ -248,7 +321,7 @@ static void init_layout_320x170(ui_layout_t *L) {
 
     L->cam_detail.mode_icon_x = 0;  L->cam_detail.mode_icon_y = 0;
     L->cam_detail.vmode_x = 0;  L->cam_detail.vmode_y = 0;
-    L->cam_detail.vmode_w = 0;  /* sentinel: 0 = omit mode/vmode widgets */
+    L->cam_detail.vmode_w = 0;
     L->cam_detail.vmode_line_space = 0;
 
     L->cam_detail.status_icon_x = 38;  L->cam_detail.status_icon_y = 29;
@@ -262,15 +335,13 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->cam_detail.bat_icon_x = 5;   L->cam_detail.bat_icon_y = 108;
     L->cam_detail.bat_text_x = 34;  L->cam_detail.bat_text_y = 113;
 
-    /* Status bar — merged bottom row */
     L->status.notif_x    = 99;   L->status.notif_y    = 143;
     L->status.notif_w    = 189;
     L->status.gps_icon_x = 291;  L->status.gps_icon_y = 145;
     L->status.gps_text_x = 0;    L->status.gps_text_y = 0;
-    L->status.gps_fix_color   = lv_color_make(0, 200, 0);  /* Green */
+    L->status.gps_fix_color   = lv_color_make(0, 200, 0);
     L->status.gps_text_visible = false;
 
-    /* Button bar — compact 27x27 colored squares */
     L->btn.y          = 143;
     L->btn.w          = 27;
     L->btn.h          = 27;
@@ -280,7 +351,6 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->btn.label_ofs_x = 0;
     L->btn.label_ofs_y = 0;
 
-    /* Button style — compact colored squares */
     L->btn_style.compact    = true;
     L->btn_style.bg_color[0] = lv_color_make(255, 0, 0);
     L->btn_style.bg_color[1] = lv_color_make(255, 255, 0);
@@ -289,7 +359,6 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->btn_style.icon_ofs_y = 2;
     L->btn_style.icon_size  = 20;
 
-    /* Submenu layout — no title, full-height entries */
     L->submenu.base_x        = 0;
     L->submenu.base_y        = 0;
     L->submenu.w             = 288;
@@ -305,17 +374,14 @@ static void init_layout_320x170(ui_layout_t *L) {
     L->submenu.max_entries   = 5;
     L->submenu.notif_x       = 0;
     L->submenu.notif_y       = 0;
-    L->submenu.notif_w       = 0;  /* no separate notification area */
+    L->submenu.notif_w       = 0;
 
-    /* Submenu buttons — vertical right-edge column */
     L->submenu_btns.column      = true;
     L->submenu_btns.col_x       = 293;
-    /* Three 27x27 squares grouped tightly at top, 4px gap between each */
     L->submenu_btns.col_btn_y[0] = 3;    L->submenu_btns.col_btn_h[0] = 27;
     L->submenu_btns.col_btn_y[1] = 34;   L->submenu_btns.col_btn_h[1] = 27;
     L->submenu_btns.col_btn_y[2] = 65;   L->submenu_btns.col_btn_h[2] = 27;
 
-    /* Mode switch */
     L->mode.icon_ofs_y  = 40;
     L->mode.label_ofs_y = 85;
 }
@@ -328,7 +394,9 @@ void ui_layout_init(lv_display_t *disp) {
     int32_t w = lv_display_get_horizontal_resolution(disp);
     int32_t h = lv_display_get_vertical_resolution(disp);
 
-    if (w >= 320 && h >= 240) {
+    if (w >= 410 && h >= 502) {
+        init_layout_410x502(&s_layout);
+    } else if (w >= 320 && h >= 240) {
         init_layout_320x240(&s_layout);
     } else if (w >= 320 && h >= 170) {
         init_layout_320x170(&s_layout);
