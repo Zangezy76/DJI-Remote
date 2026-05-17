@@ -2,6 +2,22 @@
  * LILYGO T-Watch Ultra Hardware Abstraction Layer
  * Stub implementation - LilyGoLib will be integrated when device arrives
  */
+/*
+ * NOTE: Crown button works via event system, not polling!
+ * Use instance.onEvent() callback:
+ *   BUTTON_EVENT + BUTTON_EVENT_CLICK = short press
+ *   BUTTON_EVENT + BUTTON_EVENT_LONG_PRESSED = long press
+ *   POWER_EVENT + PMU_EVENT_KEY_CLICKED = PWR button
+ *
+ * Vibration API:
+ *   instance.setHapticEffects(effect); // 0-113
+ *   instance.vibrator();
+ *
+ * Touch:
+ *   instance.getTouched()
+ *   instance.getPoint(x_array, y_array)
+ */
+
 #include "twatch_ultra_hal.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
