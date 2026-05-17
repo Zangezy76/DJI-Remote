@@ -491,6 +491,11 @@ static void gpio_monitor_task(void* pvParameters) {
  * @return ESP_OK on success, ESP_ERR_* on failure
  */
 static esp_err_t init_gpio_system(void) {
+    #if defined(CONFIG_BOARD_TWATCH_ULTRA)
+    ESP_LOGI(TAG, "T-Watch Ultra: no external GPIO triggers, skipping GPIO system init");
+    return ESP_OK;
+    #endif
+    
     esp_err_t ret = ESP_OK;
     
     ESP_LOGI(TAG, "Initializing GPIO trigger system");
