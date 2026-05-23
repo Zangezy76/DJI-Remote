@@ -1,3 +1,22 @@
+/**
+ * DJI Osmo Action 5 Pro BLE Remote on LILYGO T-Watch Ultra
+ *
+ * Features:
+ *   - BLE camera control (start/stop recording)
+ *   - Real-time GPS injection → overlay in DJI Mimo
+ *   - GPX track logger with waypoints (SD card)
+ *   - Two touch zones: upper=camera, lower=logger
+ *   - Display auto-sleep + wake by wrist shake (BHI260AP)
+ *
+ * Hardware:
+ *   - LILYGO T-Watch Ultra (ESP32-S3R8, BLE 5.0)
+ *   - DJI Osmo Action 5 Pro
+ *
+ * Author: Zangezy76
+ * License: MIT
+ * Repository: https://github.com/Zangezy76/DJI-Remote
+ */
+
 #include <LilyGoLib.h>
 #include <LV_Helper.h>
 #include <NimBLEDevice.h>
@@ -5,61 +24,84 @@
 #include <FS.h>
 #include <bosch/BoschSensorDataHelper.hpp>
 
+// ─── Camera BLE address and device ID ─────────────────────
+// Device ID is extracted from BLE Manufacturer Data:
+// AA 08 15 00 FA ... → bytes [2..5] = 0x00000015
 static const char* CAMERA_MAC   = "04:a8:5a:8c:bc:6c";
 static const uint32_t DEVICE_ID = 0x00000015;
 
+// ─── GPX file format ──────────────────────────────────────
+// GPX uses append-by-seek: closing tags are always at end of file.
+// To add a trackpoint: seek to (fileSize - FULL_CLOSE_LEN), write point + closing tags.
+// To add a waypoint: seek to (fileSize - GPX_CLOSE_LEN), write waypoint + </gpx>.
 #define TRKSEG_CLOSE     "    </trkseg>\n  </trk>\n"
 #define GPX_CLOSE        "</gpx>\n"
 #define TRKSEG_CLOSE_LEN 22
 #define GPX_CLOSE_LEN    7
-#define FULL_CLOSE_LEN   29
+#define FULL_CLOSE_LEN   29  // TRKSEG_CLOSE_LEN + GPX_CLOSE_LEN
 static char  gpxPath[32] = "";
-static int   lastGpxDay  = -1;
+static int   lastGpxDay  = -1;         // track day changes for new file
 static bool  sdReady     = false;
-static bool  gpxLogging  = false;
+static bool  gpxLogging  = false;      // manual logger on/off
 static uint32_t lastTrackMs = 0;
-#define TRACK_INTERVAL_MS 60000UL
+#define TRACK_INTERVAL_MS 60000UL      // write track point every 1 minute
 
+// ─── SD event log ─────────────────────────────────────────
 static char logPath[32] = "";
 static int  lastLogDay  = -1;
-static uint32_t startMs = 0;
+static uint32_t startMs = 0;           // used to measure time-to-first-fix
 static bool firstFix    = false;
 static uint32_t lastBatLogMs = 0;
-#define BAT_LOG_INTERVAL_MS 1800000UL
+#define BAT_LOG_INTERVAL_MS 1800000UL  // log battery every 30 minutes
 
-#define DISPLAY_TIMEOUT_MS 60000UL
+// ─── Display sleep/wake ───────────────────────────────────
+#define DISPLAY_TIMEOUT_MS 60000UL     // sleep after 1 minute of inactivity
 static uint32_t lastActivityMs = 0;
 static bool displayOn = true;
-static float prevAccelMag = 0.0f;
-static uint32_t sleepStartMs = 0;
 
+// ─── Accelerometer for shake-to-wake ─────────────────────
+// Uses BHI260AP ACCEL_PASSTHROUGH via SensorLib/BoschSensorDataHelper
+// Shake detected by delta between consecutive magnitude samples
 SensorXYZ accel(SensorBHI260AP::ACCEL_PASSTHROUGH, instance.sensor);
+static float prevAccelMag = 0.0f;
+static uint32_t sleepStartMs = 0;      // cooldown: ignore shake for 2s after sleep
 
+// ─── UI widgets ───────────────────────────────────────────
+// Display: 2.01" AMOLED 410×502px, rounded corners (~50px inset)
+// Touch zones: upper 2/3 (y<335) = camera, lower 1/3 (y>=335) = logger
 #define ZONE_SPLIT 335
-static lv_obj_t* lblTime   = nullptr;
-static lv_obj_t* lblRec    = nullptr;
-static lv_obj_t* lblCoords = nullptr;
-static lv_obj_t* lblSpeed  = nullptr;
-static lv_obj_t* lblCamSat = nullptr;
-static lv_obj_t* lblLog    = nullptr;
-static lv_obj_t* lblBatSd  = nullptr;
+static lv_obj_t* lblTime   = nullptr;  // UTC time top-left
+static lv_obj_t* lblRec    = nullptr;  // ● / ● REC indicator top-right
+static lv_obj_t* lblCoords = nullptr;  // GPS coordinates center
+static lv_obj_t* lblSpeed  = nullptr;  // speed + altitude
+static lv_obj_t* lblCamSat = nullptr;  // camera status + satellite count
+static lv_obj_t* lblLog    = nullptr;  // logger status
+static lv_obj_t* lblBatSd  = nullptr;  // battery + SD card status
 
+// ─── BLE state ────────────────────────────────────────────
+// IMPORTANT: never call connect() from setup() — it hangs the system.
+// All BLE operations run in a dedicated FreeRTOS task.
+// UI updates from BLE task use flags, never direct LVGL calls.
 static NimBLEClient*               pClient   = nullptr;
 static NimBLERemoteCharacteristic* pWriteChr = nullptr;
 static bool    connected     = false;
 static bool    isRecording   = false;
-static uint16_t seqNum       = 0;
-static bool    triggerConnect = false;
+static uint16_t seqNum       = 0;      // incremented with every frame sent
+static bool    triggerConnect = false; // set by double-tap, consumed by bleTask
 
 static uint32_t lastUiUpdate = 0;
 
+// ─── Touch state ──────────────────────────────────────────
+// Touch is processed on release (touchActive goes false).
+// Duration determines tap type: short=action, long(>600ms)=logger toggle.
 static uint32_t touchStartMs = 0;
 static bool touchActive = false;
 static int16_t touchX = 0, touchY = 0;
 static uint32_t lastTouchMs = 0;
 
 // ═══════════════════════════════════════════════════════════
-// CRC16 / CRC32
+// DJI CRC16 — Fletcher variant, init=0x3AA3
+// Applied to frame bytes 0–9 (header only, before payload)
 // ═══════════════════════════════════════════════════════════
 static const uint16_t crc16_table[256] = {
     0x0000,0xc0c1,0xc181,0x0140,0xc301,0x03c0,0x0280,0xc241,
@@ -96,10 +138,18 @@ static const uint16_t crc16_table[256] = {
     0x8201,0x42c0,0x4380,0x8341,0x4100,0x81c1,0x8081,0x4040
 };
 uint16_t dji_crc16(const uint8_t* d, size_t l) {
-    uint16_t crc=0x3AA3;
-    while(l--){uint8_t i=(crc^*d++)&0xFF;crc=(crc16_table[i]^(crc>>8))&0xFFFF;}
+    uint16_t crc = 0x3AA3;
+    while (l--) {
+        uint8_t i = (crc ^ *d++) & 0xFF;
+        crc = (crc16_table[i] ^ (crc >> 8)) & 0xFFFF;
+    }
     return crc;
 }
+
+// ═══════════════════════════════════════════════════════════
+// DJI CRC32 — Fletcher variant, init=0x00003AA3
+// Applied to the entire frame (before the 4 CRC bytes)
+// ═══════════════════════════════════════════════════════════
 static const uint32_t crc32_table[256] = {
     0x00000000,0x77073096,0xee0e612c,0x990951ba,0x076dc419,0x706af48f,0xe963a535,0x9e6495a3,
     0x0edb8832,0x79dcb8a4,0xe0d5e91e,0x97d2d988,0x09b64c2b,0x7eb17cbd,0xe7b82d07,0x90bf1d91,
@@ -135,29 +185,60 @@ static const uint32_t crc32_table[256] = {
     0xb3667a2e,0xc4614ab8,0x5d681b02,0x2a6f2b94,0xb40bbe37,0xc30c8ea1,0x5a05df1b,0x2d02ef8d
 };
 uint32_t dji_crc32(const uint8_t* d, size_t l) {
-    uint32_t crc=0x00003AA3;
-    while(l--){uint8_t i=(crc^*d++)&0xFF;crc=(crc32_table[i]^(crc>>8))&0xFFFFFFFF;}
+    uint32_t crc = 0x00003AA3;
+    while (l--) {
+        uint8_t i = (crc ^ *d++) & 0xFF;
+        crc = (crc32_table[i] ^ (crc >> 8)) & 0xFFFFFFFF;
+    }
     return crc;
 }
+
+// ═══════════════════════════════════════════════════════════
+// DJI Frame Builder
+//
+// Frame layout:
+//   [0]    SOF = 0xAA
+//   [1-2]  version(6) << 10 | length(10), little-endian
+//   [3]    CMD_TYPE: 0x00=no ack, 0x20=camera response
+//   [4]    ENC (encryption flags, always 0x00)
+//   [5-7]  reserved (0x00 0x00 0x00)
+//   [8-9]  sequence number, little-endian
+//   [10-11] CRC16 of bytes 0-9
+//   [12]   CMD_SET (command category)
+//   [13]   CMD_ID  (command ID)
+//   [14..] payload data
+//   [last 4] CRC32 of entire frame before these bytes
+// ═══════════════════════════════════════════════════════════
 size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
                        const uint8_t* data, size_t data_len, uint16_t seq) {
-    size_t total=14+data_len+4, off=0;
-    buf[off++]=0xAA; buf[off++]=total&0xFF; buf[off++]=(total>>8)&0xFF;
-    buf[off++]=0x00; buf[off++]=0x00;
-    buf[off++]=0x00; buf[off++]=0x00; buf[off++]=0x00;
-    buf[off++]=seq&0xFF; buf[off++]=(seq>>8)&0xFF;
-    uint16_t c16=dji_crc16(buf,off);
-    buf[off++]=c16&0xFF; buf[off++]=(c16>>8)&0xFF;
-    buf[off++]=cmd_set; buf[off++]=cmd_id;
-    if(data&&data_len>0){memcpy(buf+off,data,data_len);off+=data_len;}
-    uint32_t c32=dji_crc32(buf,off);
-    buf[off++]=c32&0xFF; buf[off++]=(c32>>8)&0xFF;
-    buf[off++]=(c32>>16)&0xFF; buf[off++]=(c32>>24)&0xFF;
+    size_t total = 14 + data_len + 4;
+    size_t off = 0;
+    buf[off++] = 0xAA;
+    buf[off++] = total & 0xFF;
+    buf[off++] = (total >> 8) & 0xFF;
+    buf[off++] = 0x00;  // CMD_TYPE
+    buf[off++] = 0x00;  // ENC
+    buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00;  // reserved
+    buf[off++] = seq & 0xFF;
+    buf[off++] = (seq >> 8) & 0xFF;
+    uint16_t c16 = dji_crc16(buf, off);
+    buf[off++] = c16 & 0xFF;
+    buf[off++] = (c16 >> 8) & 0xFF;
+    buf[off++] = cmd_set;
+    buf[off++] = cmd_id;
+    if (data && data_len > 0) { memcpy(buf + off, data, data_len); off += data_len; }
+    uint32_t c32 = dji_crc32(buf, off);
+    buf[off++] = c32 & 0xFF;
+    buf[off++] = (c32 >> 8) & 0xFF;
+    buf[off++] = (c32 >> 16) & 0xFF;
+    buf[off++] = (c32 >> 24) & 0xFF;
     return off;
 }
 
 // ═══════════════════════════════════════════════════════════
-// Дисплей — только яркость, без sleepDisplay()
+// Display sleep / wake
+// Uses setBrightness(0) instead of sleepDisplay() to avoid
+// conflicts with instance.loop() internal state machine
 // ═══════════════════════════════════════════════════════════
 void wakeDisplay() {
     if (!displayOn) {
@@ -168,231 +249,320 @@ void wakeDisplay() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// LOG
+// SD Event Log
+// One log file per day: /log_YYYY_MM_DD.txt
+// Falls back to /log_nodate.txt before first GPS fix
 // ═══════════════════════════════════════════════════════════
 void logWrite(const char* msg) {
     Serial.println(msg);
-    if(!sdReady) return;
-    if(instance.gps.date.isValid()&&instance.gps.date.day()!=lastLogDay){
-        lastLogDay=instance.gps.date.day();
-        snprintf(logPath,sizeof(logPath),"/log_%04d_%02d_%02d.txt",
-            instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
+    if (!sdReady) return;
+    if (instance.gps.date.isValid() && instance.gps.date.day() != lastLogDay) {
+        lastLogDay = instance.gps.date.day();
+        snprintf(logPath, sizeof(logPath), "/log_%04d_%02d_%02d.txt",
+            instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
     }
-    if(logPath[0]=='\0') snprintf(logPath,sizeof(logPath),"/log_nodate.txt");
-    File f=SD.open(logPath,FILE_APPEND);
-    if(!f) return;
-    if(instance.gps.time.isValid())
+    if (logPath[0] == '\0') snprintf(logPath, sizeof(logPath), "/log_nodate.txt");
+    File f = SD.open(logPath, FILE_APPEND);
+    if (!f) return;
+    if (instance.gps.time.isValid())
         f.printf("[%02d:%02d:%02d] %s\n",
-            instance.gps.time.hour(),instance.gps.time.minute(),
-            instance.gps.time.second(),msg);
-    else f.printf("[%08lu] %s\n",millis(),msg);
+            instance.gps.time.hour(), instance.gps.time.minute(),
+            instance.gps.time.second(), msg);
+    else f.printf("[%08lu] %s\n", millis(), msg);
     f.close();
 }
-void logWritef(const char* fmt,...) {
-    char buf[128]; va_list a; va_start(a,fmt);
-    vsnprintf(buf,sizeof(buf),fmt,a); va_end(a);
+void logWritef(const char* fmt, ...) {
+    char buf[128];
+    va_list a; va_start(a, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, a);
+    va_end(a);
     logWrite(buf);
 }
 
 // ═══════════════════════════════════════════════════════════
-// BLE команды
+// DJI Command: Start / Stop Recording
+//
+// CMD_SET=0x1D, CMD_ID=0x03
+// Payload: device_id (4 bytes LE) + action (1 byte) + reserved (4 bytes)
+//   action: 0x00 = start, 0x01 = stop
 // ═══════════════════════════════════════════════════════════
 void sendRecordCommand(bool start) {
-    if(!pWriteChr||!connected) return;
+    if (!pWriteChr || !connected) return;
     uint8_t payload[9];
-    payload[0]=DEVICE_ID&0xFF; payload[1]=(DEVICE_ID>>8)&0xFF;
-    payload[2]=(DEVICE_ID>>16)&0xFF; payload[3]=(DEVICE_ID>>24)&0xFF;
-    payload[4]=start?0x00:0x01;
-    payload[5]=payload[6]=payload[7]=payload[8]=0x00;
+    payload[0] = DEVICE_ID & 0xFF;
+    payload[1] = (DEVICE_ID >> 8) & 0xFF;
+    payload[2] = (DEVICE_ID >> 16) & 0xFF;
+    payload[3] = (DEVICE_ID >> 24) & 0xFF;
+    payload[4] = start ? 0x00 : 0x01;
+    payload[5] = payload[6] = payload[7] = payload[8] = 0x00;
     uint8_t frame[64];
-    size_t len=dji_build_frame(frame,0x1D,0x03,payload,sizeof(payload),++seqNum);
-    bool ok=pWriteChr->writeValue(frame,len,false);
-    logWritef("REC %s: %s",start?"START":"STOP",ok?"OK":"FAIL");
-}
-
-void sendGpsData() {
-    if(!pWriteChr||!connected) return;
-    if(!instance.gps.location.isValid()||!instance.gps.date.isValid()||!instance.gps.time.isValid()) return;
-    if(instance.gps.satellites.value()==0) return;
-    uint8_t payload[45]; memset(payload,0,sizeof(payload)); uint8_t* p=payload;
-    int32_t ymd=instance.gps.date.year()*10000+instance.gps.date.month()*100+instance.gps.date.day();
-    memcpy(p,&ymd,4); p+=4;
-    int32_t hms=instance.gps.time.hour()*10000+instance.gps.time.minute()*100+instance.gps.time.second();
-    memcpy(p,&hms,4); p+=4;
-    int32_t lon=(int32_t)(instance.gps.location.lng()*1e7); memcpy(p,&lon,4); p+=4;
-    int32_t lat=(int32_t)(instance.gps.location.lat()*1e7); memcpy(p,&lat,4); p+=4;
-    int32_t alt=instance.gps.altitude.isValid()?(int32_t)(instance.gps.altitude.meters()*1000.0f):0;
-    memcpy(p,&alt,4); p+=4;
-    float spd=instance.gps.speed.isValid()?(float)instance.gps.speed.mps():0.0f;
-    if(spd<0.5f) spd=0.0f;
-    float crs=instance.gps.course.isValid()?(float)(instance.gps.course.deg()*3.14159265f/180.0f):0.0f;
-    float sn=spd*cosf(crs)*100.0f,se=spd*sinf(crs)*100.0f,sd=0.0f;
-    memcpy(p,&sn,4); p+=4; memcpy(p,&se,4); p+=4; memcpy(p,&sd,4); p+=4;
-    float va=2.0f,ha=2.0f,sa=0.1f;
-    memcpy(p,&va,4); p+=4; memcpy(p,&ha,4); p+=4; memcpy(p,&sa,4); p+=4;
-    *p=(uint8_t)instance.gps.satellites.value();
-    uint8_t frame[80];
-    size_t len=dji_build_frame(frame,0x00,0x17,payload,sizeof(payload),++seqNum);
-    bool ok=pWriteChr->writeValue(frame,len,false);
-    if(!ok) logWrite("GPS inject FAIL");
+    size_t len = dji_build_frame(frame, 0x1D, 0x03, payload, sizeof(payload), ++seqNum);
+    bool ok = pWriteChr->writeValue(frame, len, false);
+    logWritef("REC %s: %s", start ? "START" : "STOP", ok ? "OK" : "FAIL");
 }
 
 // ═══════════════════════════════════════════════════════════
-// GPX
+// DJI Command: GPS Injection
+//
+// CMD_SET=0x00, CMD_ID=0x17
+// Payload: 45 bytes, all values little-endian
+//
+//   int32  year_month_day     YYYYMMDD (e.g. 20260524)
+//   int32  hour_minute_second HHMMSS   (e.g. 82300)
+//   int32  longitude          degrees × 1e7
+//   int32  latitude           degrees × 1e7
+//   int32  altitude           millimeters
+//   float  speed_north        cm/s
+//   float  speed_east         cm/s
+//   float  speed_down         cm/s (positive = descending)
+//   float  vertical_accuracy  meters
+//   float  horizontal_accuracy meters
+//   float  speed_accuracy     m/s
+//   uint8  satellite_count    must be > 0
+//
+// Send at 1Hz while connected. Camera requires continuous updates
+// to maintain the overlay in DJI Mimo.
+// Speed < 0.5 m/s is zeroed to avoid jitter at standstill.
+// ═══════════════════════════════════════════════════════════
+void sendGpsData() {
+    if (!pWriteChr || !connected) return;
+    if (!instance.gps.location.isValid() ||
+        !instance.gps.date.isValid() ||
+        !instance.gps.time.isValid()) return;
+    if (instance.gps.satellites.value() == 0) return;
+
+    uint8_t payload[45];
+    memset(payload, 0, sizeof(payload));
+    uint8_t* p = payload;
+
+    int32_t ymd = instance.gps.date.year() * 10000
+                + instance.gps.date.month() * 100
+                + instance.gps.date.day();
+    memcpy(p, &ymd, 4); p += 4;
+
+    int32_t hms = instance.gps.time.hour() * 10000
+                + instance.gps.time.minute() * 100
+                + instance.gps.time.second();
+    memcpy(p, &hms, 4); p += 4;
+
+    int32_t lon = (int32_t)(instance.gps.location.lng() * 1e7);
+    memcpy(p, &lon, 4); p += 4;
+
+    int32_t lat = (int32_t)(instance.gps.location.lat() * 1e7);
+    memcpy(p, &lat, 4); p += 4;
+
+    int32_t alt = instance.gps.altitude.isValid()
+                ? (int32_t)(instance.gps.altitude.meters() * 1000.0f) : 0;
+    memcpy(p, &alt, 4); p += 4;
+
+    // Decompose speed into North/East components using course angle
+    float spd = instance.gps.speed.isValid() ? (float)instance.gps.speed.mps() : 0.0f;
+    if (spd < 0.5f) spd = 0.0f;  // noise filter at standstill
+    float crs = instance.gps.course.isValid()
+              ? (float)(instance.gps.course.deg() * 3.14159265f / 180.0f) : 0.0f;
+    float sn = spd * cosf(crs) * 100.0f;  // cm/s north
+    float se = spd * sinf(crs) * 100.0f;  // cm/s east
+    float sd = 0.0f;
+    memcpy(p, &sn, 4); p += 4;
+    memcpy(p, &se, 4); p += 4;
+    memcpy(p, &sd, 4); p += 4;
+
+    float va = 2.0f, ha = 2.0f, sa = 0.1f;  // accuracy estimates
+    memcpy(p, &va, 4); p += 4;
+    memcpy(p, &ha, 4); p += 4;
+    memcpy(p, &sa, 4); p += 4;
+
+    *p = (uint8_t)instance.gps.satellites.value();
+
+    uint8_t frame[80];
+    size_t len = dji_build_frame(frame, 0x00, 0x17, payload, sizeof(payload), ++seqNum);
+    bool ok = pWriteChr->writeValue(frame, len, false);
+    if (!ok) logWrite("GPS inject FAIL");
+}
+
+// ═══════════════════════════════════════════════════════════
+// GPX File Management
+//
+// File: /track_YYYY_MM_DD.gpx (one per day, GPS date)
+// Structure uses seek-append to keep file always valid XML:
+//   header + <trkseg> ... </trkseg></trk> [waypoints] </gpx>
 // ═══════════════════════════════════════════════════════════
 void gpxCreateFile(const char* path) {
-    File f=SD.open(path,FILE_WRITE);
-    if(!f){logWritef("GPX create FAIL: %s",path);return;}
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { logWritef("GPX create FAIL: %s", path); return; }
     f.printf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     f.printf("<gpx version=\"1.1\" creator=\"TWatch-DJI\">\n");
     f.printf("  <trk>\n    <name>%04d-%02d-%02d</name>\n    <trkseg>\n",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
-    f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
-    logWritef("GPX created: %s",path);
+        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
+    f.print(TRKSEG_CLOSE);
+    f.print(GPX_CLOSE);
+    f.close();
+    logWritef("GPX created: %s", path);
 }
+
 void gpxCheckDay() {
-    if(!sdReady||!instance.gps.date.isValid()) return;
-    if(instance.gps.date.day()==lastGpxDay) return;
-    lastGpxDay=instance.gps.date.day();
-    snprintf(gpxPath,sizeof(gpxPath),"/track_%04d_%02d_%02d.gpx",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
-    if(!SD.exists(gpxPath)) gpxCreateFile(gpxPath);
-    else logWritef("GPX using: %s",gpxPath);
+    if (!sdReady || !instance.gps.date.isValid()) return;
+    if (instance.gps.date.day() == lastGpxDay) return;
+    lastGpxDay = instance.gps.date.day();
+    snprintf(gpxPath, sizeof(gpxPath), "/track_%04d_%02d_%02d.gpx",
+        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
+    if (!SD.exists(gpxPath)) gpxCreateFile(gpxPath);
+    else logWritef("GPX using: %s", gpxPath);
 }
+
+// Write a track point (called every TRACK_INTERVAL_MS when logger is ON)
 void gpxWriteTrackPoint() {
-    if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
-    File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f) return;
-    uint32_t size=f.size();
-    if(size<FULL_CLOSE_LEN){f.close();return;}
-    f.seek(size-FULL_CLOSE_LEN);
+    if (!sdReady || gpxPath[0] == '\0' || !instance.gps.location.isValid()) return;
+    File f = SD.open(gpxPath, FILE_WRITE);
+    if (!f) return;
+    uint32_t size = f.size();
+    if (size < FULL_CLOSE_LEN) { f.close(); return; }
+    f.seek(size - FULL_CLOSE_LEN);  // overwrite closing tags
     f.printf("      <trkpt lat=\"%.6f\" lon=\"%.6f\">\n",
-        instance.gps.location.lat(),instance.gps.location.lng());
+        instance.gps.location.lat(), instance.gps.location.lng());
     f.printf("        <ele>%.1f</ele>\n",
-        instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0);
+        instance.gps.altitude.isValid() ? instance.gps.altitude.meters() : 0.0);
     f.printf("        <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
-        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
-    if(instance.gps.speed.isValid())
-        f.printf("        <speed>%.2f</speed>\n",instance.gps.speed.mps());
+        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+        instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
+    if (instance.gps.speed.isValid())
+        f.printf("        <speed>%.2f</speed>\n", instance.gps.speed.mps());
     f.printf("      </trkpt>\n");
-    f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
+    f.print(TRKSEG_CLOSE);
+    f.print(GPX_CLOSE);
+    f.close();
 }
+
+// Write a named waypoint (REC START/STOP, BITE N, etc.)
+// Waypoints are appended after </trk>, before </gpx>
 void gpxWriteWaypoint(const char* name) {
-    if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
-    File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f) return;
-    uint32_t size=f.size();
-    if(size<GPX_CLOSE_LEN){f.close();return;}
-    f.seek(size-GPX_CLOSE_LEN);
+    if (!sdReady || gpxPath[0] == '\0' || !instance.gps.location.isValid()) return;
+    File f = SD.open(gpxPath, FILE_WRITE);
+    if (!f) return;
+    uint32_t size = f.size();
+    if (size < GPX_CLOSE_LEN) { f.close(); return; }
+    f.seek(size - GPX_CLOSE_LEN);  // overwrite only </gpx>
     f.printf("  <wpt lat=\"%.6f\" lon=\"%.6f\">\n",
-        instance.gps.location.lat(),instance.gps.location.lng());
+        instance.gps.location.lat(), instance.gps.location.lng());
     f.printf("    <ele>%.1f</ele>\n",
-        instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0);
+        instance.gps.altitude.isValid() ? instance.gps.altitude.meters() : 0.0);
     f.printf("    <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
-        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
-    f.printf("    <name>%s</name>\n",name);
+        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+        instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
+    f.printf("    <name>%s</name>\n", name);
     f.printf("  </wpt>\n");
-    f.print(GPX_CLOSE); f.close();
-    logWritef("GPX wpt: %s",name);
+    f.print(GPX_CLOSE);
+    f.close();
+    logWritef("GPX wpt: %s", name);
 }
 
 // ═══════════════════════════════════════════════════════════
-// Управление записью и логгером
+// Recording toggle
+// Haptic feedback: 1 pulse = start, 2 pulses = stop
+// Also saves REC START/STOP waypoint to GPX
 // ═══════════════════════════════════════════════════════════
 void toggleRecording() {
     instance.setHapticEffects(14); instance.vibrator();
-    if(!connected||!pWriteChr) return;
-    isRecording=!isRecording;
+    if (!connected || !pWriteChr) return;
+    isRecording = !isRecording;
     sendRecordCommand(isRecording);
-    gpxWriteWaypoint(isRecording?"REC START":"REC STOP");
-    if(!isRecording){delay(200);instance.setHapticEffects(14);instance.vibrator();}
-    if(isRecording){
-        lv_label_set_text(lblRec,"● REC");
-        lv_obj_set_style_text_color(lblRec,lv_palette_main(LV_PALETTE_RED),0);
+    gpxWriteWaypoint(isRecording ? "REC START" : "REC STOP");
+    if (!isRecording) { delay(200); instance.setHapticEffects(14); instance.vibrator(); }
+    if (isRecording) {
+        lv_label_set_text(lblRec, "● REC");
+        lv_obj_set_style_text_color(lblRec, lv_palette_main(LV_PALETTE_RED), 0);
     } else {
-        lv_label_set_text(lblRec,"●");
-        lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
+        lv_label_set_text(lblRec, "●");
+        lv_obj_set_style_text_color(lblRec, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
     }
 }
 
+// ═══════════════════════════════════════════════════════════
+// Logger toggle (long tap on lower zone)
+// ═══════════════════════════════════════════════════════════
 void toggleLogger() {
     instance.setHapticEffects(14); instance.vibrator();
-    gpxLogging=!gpxLogging;
-    if(gpxLogging){
+    gpxLogging = !gpxLogging;
+    if (gpxLogging) {
         gpxCheckDay();
-        lv_label_set_text(lblLog,"▶ LOG: ON");
-        lv_obj_set_style_text_color(lblLog,lv_palette_main(LV_PALETTE_GREEN),0);
+        lv_label_set_text(lblLog, "▶ LOG: ON");
+        lv_obj_set_style_text_color(lblLog, lv_palette_main(LV_PALETTE_GREEN), 0);
         logWrite("Logger START");
     } else {
-        lv_label_set_text(lblLog,"■ LOG: OFF");
-        lv_obj_set_style_text_color(lblLog,lv_palette_darken(LV_PALETTE_GREY,2),0);
+        lv_label_set_text(lblLog, "■ LOG: OFF");
+        lv_obj_set_style_text_color(lblLog, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
         logWrite("Logger STOP");
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-// Обработка тапов
+// Touch zone handler
+//
+// Upper zone (y < ZONE_SPLIT):
+//   - Short tap      → start/stop recording
+//   - Double tap     → connect to camera (triggerConnect flag → bleTask)
+//
+// Lower zone (y >= ZONE_SPLIT):
+//   - Long tap       → start/stop GPX logger
+//   - Double tap     → save "BITE N" waypoint (fishing spot)
+//   - Short single   → haptic hint (zone reminder)
 // ═══════════════════════════════════════════════════════════
 void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
-    if(millis()-lastTouchMs<250) return;
-    lastTouchMs=millis();
+    if (millis() - lastTouchMs < 250) return;
+    lastTouchMs = millis();
 
-    if(y < ZONE_SPLIT) {
-        // ── Верхняя зона: камера ─────────────────────────
-        if(duration < 600) {
+    if (y < ZONE_SPLIT) {
+        // Upper zone — camera control
+        if (duration < 600) {
             static uint32_t lastTopTapMs = 0;
             static int topTapCount = 0;
-            if(millis()-lastTopTapMs < 400) topTapCount++;
+            if (millis() - lastTopTapMs < 400) topTapCount++;
             else topTapCount = 1;
             lastTopTapMs = millis();
-            if(topTapCount >= 2) {
+            if (topTapCount >= 2) {
+                // Double tap → connect camera
                 topTapCount = 0;
-                if(!connected) {
+                if (!connected) {
                     triggerConnect = true;
                     instance.setHapticEffects(7); instance.vibrator();
                     delay(100);
                     instance.setHapticEffects(7); instance.vibrator();
-                    lv_label_set_text(lblCamSat,"Cam: connecting...");
+                    lv_label_set_text(lblCamSat, "Cam: connecting...");
                     logWrite("Double tap: connect camera");
                 }
             } else {
+                // Single tap → toggle recording
                 toggleRecording();
             }
         }
     } else {
-        // ── Нижняя зона: логгер ───────────────────────────
-        if(duration >= 600) {
-            // Долгий тап → логгер
+        // Lower zone — logger control
+        if (duration >= 600) {
+            // Long tap → toggle logger
             toggleLogger();
         } else {
-            // Короткий тап — детектируем двойной
             static uint32_t lastBotTapMs = 0;
             static int botTapCount = 0;
-            if(millis()-lastBotTapMs < 400) botTapCount++;
+            if (millis() - lastBotTapMs < 400) botTapCount++;
             else botTapCount = 1;
             lastBotTapMs = millis();
-
-            if(botTapCount >= 2) {
+            if (botTapCount >= 2) {
+                // Double tap → save fishing waypoint
                 botTapCount = 0;
-                // Двойной тап → вейпоинт клёва
                 static int biteCount = 0;
                 biteCount++;
                 char name[16];
                 snprintf(name, sizeof(name), "BITE %d", biteCount);
                 gpxWriteWaypoint(name);
-                // Три коротких вибрации
-                for(int i=0;i<3;i++){
-                    instance.setHapticEffects(14);
-                    instance.vibrator();
+                // Triple pulse = bite saved
+                for (int i = 0; i < 3; i++) {
+                    instance.setHapticEffects(14); instance.vibrator();
                     delay(150);
                 }
                 logWritef("Waypoint: %s %.5f,%.5f", name,
-                    instance.gps.location.lat(),
-                    instance.gps.location.lng());
+                    instance.gps.location.lat(), instance.gps.location.lng());
             } else {
-                // Одиночный тап — подсказка
+                // Single short tap → hint vibration
                 instance.setHapticEffects(1); instance.vibrator();
             }
         }
@@ -400,92 +570,123 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// UI
+// UI update (called every 2 seconds)
 // ═══════════════════════════════════════════════════════════
 void updateUI() {
     char buf[128];
-    if(instance.gps.time.isValid())
-        snprintf(buf,sizeof(buf),"%02d:%02d UTC",
-            instance.gps.time.hour(),instance.gps.time.minute());
-    else snprintf(buf,sizeof(buf),"--:--");
-    lv_label_set_text(lblTime,buf);
 
-    if(instance.gps.location.isValid()){
-        lv_obj_set_style_text_color(lblCoords,lv_color_white(),0);
-        snprintf(buf,sizeof(buf),"%.5f\n%.5f",
-            instance.gps.location.lat(),instance.gps.location.lng());
+    // UTC time from GPS
+    if (instance.gps.time.isValid())
+        snprintf(buf, sizeof(buf), "%02d:%02d UTC",
+            instance.gps.time.hour(), instance.gps.time.minute());
+    else snprintf(buf, sizeof(buf), "--:--");
+    lv_label_set_text(lblTime, buf);
+
+    // Coordinates — yellow while searching, white when fixed
+    if (instance.gps.location.isValid()) {
+        lv_obj_set_style_text_color(lblCoords, lv_color_white(), 0);
+        snprintf(buf, sizeof(buf), "%.5f\n%.5f",
+            instance.gps.location.lat(), instance.gps.location.lng());
     } else {
-        lv_obj_set_style_text_color(lblCoords,lv_palette_main(LV_PALETTE_YELLOW),0);
-        snprintf(buf,sizeof(buf),"GPS\nconnecting...");
+        lv_obj_set_style_text_color(lblCoords, lv_palette_main(LV_PALETTE_YELLOW), 0);
+        snprintf(buf, sizeof(buf), "GPS\nconnecting...");
     }
-    lv_label_set_text(lblCoords,buf);
+    lv_label_set_text(lblCoords, buf);
 
-    if(instance.gps.location.isValid()){
-        float kmh=instance.gps.speed.isValid()?(float)instance.gps.speed.kmph():0.0f;
-        if(kmh<2.0f) kmh=0.0f;
-        snprintf(buf,sizeof(buf),"%.1f km/h   %.0f m",
-            kmh,instance.gps.altitude.isValid()?(float)instance.gps.altitude.meters():0.0f);
+    // Speed + altitude (speed < 2 km/h shown as 0 to suppress GPS jitter)
+    if (instance.gps.location.isValid()) {
+        float kmh = instance.gps.speed.isValid() ? (float)instance.gps.speed.kmph() : 0.0f;
+        if (kmh < 2.0f) kmh = 0.0f;
+        snprintf(buf, sizeof(buf), "%.1f km/h   %.0f m",
+            kmh, instance.gps.altitude.isValid() ? (float)instance.gps.altitude.meters() : 0.0f);
     } else {
-        snprintf(buf,sizeof(buf),"-- km/h   -- m");
+        snprintf(buf, sizeof(buf), "-- km/h   -- m");
     }
-    lv_label_set_text(lblSpeed,buf);
+    lv_label_set_text(lblSpeed, buf);
 
-    int sats=(int)instance.gps.satellites.value();
-    if(connected)
-        snprintf(buf,sizeof(buf),"Cam: OK   Sat: %d",sats);
-    else
-        snprintf(buf,sizeof(buf),"Cam: --   Sat: %d",sats);
-    lv_label_set_text(lblCamSat,buf);
+    // Camera connection status + satellite count
+    int sats = (int)instance.gps.satellites.value();
+    snprintf(buf, sizeof(buf), connected ? "Cam: OK   Sat: %d" : "Cam: --   Sat: %d", sats);
+    lv_label_set_text(lblCamSat, buf);
 
-    snprintf(buf,sizeof(buf),"Bat: %d%%    SD: %s",
-        instance.pmu.getBatteryPercent(), sdReady?"OK":"--");
-    lv_label_set_text(lblBatSd,buf);
+    // Battery + SD card
+    snprintf(buf, sizeof(buf), "Bat: %d%%    SD: %s",
+        instance.pmu.getBatteryPercent(), sdReady ? "OK" : "--");
+    lv_label_set_text(lblBatSd, buf);
 }
 
 // ═══════════════════════════════════════════════════════════
-// BLE
+// BLE Callbacks
 // ═══════════════════════════════════════════════════════════
 class CameraCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* c, int reason) override {
-        connected=false; isRecording=false; pWriteChr=nullptr;
-        lv_label_set_text(lblRec,"●");
-        lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
-        logWritef("BLE disconnected %d",reason);
+        connected = false; isRecording = false; pWriteChr = nullptr;
+        lv_label_set_text(lblRec, "●");
+        lv_obj_set_style_text_color(lblRec, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+        logWritef("BLE disconnected, reason=%d", reason);
     }
 };
 
+// ═══════════════════════════════════════════════════════════
+// BLE Task (FreeRTOS)
+//
+// Waits for triggerConnect flag (set by double-tap in upper zone).
+// On connect: discovers service 0xFFF0, write char 0xFFF3, notify 0xFFF4.
+// Then injects GPS data every 1 second until disconnected.
+// On disconnect: cleans up and waits for next trigger.
+//
+// BLE service UUIDs (full 128-bit):
+//   Service:  0000fff0-0000-1000-8000-00805f9b34fb
+//   Write:    0000fff3-0000-1000-8000-00805f9b34fb  (RWNI)
+//   Notify:   0000fff4-0000-1000-8000-00805f9b34fb  (RWNI)
+// ═══════════════════════════════════════════════════════════
 void bleTask(void* pvParameters) {
-    vTaskDelay(2000/portTICK_PERIOD_MS);
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     NimBLEDevice::init("TWatch-DJI");
     NimBLEDevice::setPower(3);
     NimBLEDevice::setMTU(512);
-    NimBLEAddress addr(std::string(CAMERA_MAC),BLE_ADDR_PUBLIC);
-    while(true){
-        while(!triggerConnect) vTaskDelay(200/portTICK_PERIOD_MS);
-        triggerConnect=false;
-        pClient=NimBLEDevice::createClient();
-        pClient->setClientCallbacks(new CameraCallbacks(),false);
+    NimBLEAddress addr(std::string(CAMERA_MAC), BLE_ADDR_PUBLIC);
+
+    while (true) {
+        // Wait for double-tap trigger
+        while (!triggerConnect) vTaskDelay(200 / portTICK_PERIOD_MS);
+        triggerConnect = false;
+
+        pClient = NimBLEDevice::createClient();
+        pClient->setClientCallbacks(new CameraCallbacks(), false);
         pClient->setConnectTimeout(10000);
+
         logWrite("BLE connecting...");
-        if(!pClient->connect(addr)){
-            logWrite("BLE FAIL");
-            NimBLEDevice::deleteClient(pClient); pClient=nullptr;
-            lv_label_set_text(lblCamSat,"Cam: FAIL (2x tap)");
+        if (!pClient->connect(addr)) {
+            logWrite("BLE connect FAIL");
+            NimBLEDevice::deleteClient(pClient); pClient = nullptr;
+            lv_label_set_text(lblCamSat, "Cam: FAIL (2x tap)");
             continue;
         }
-        auto svc=pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
-        if(!svc){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
-        pWriteChr=svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
-        if(!pWriteChr){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
-        auto nc=svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
-        if(nc&&nc->canNotify())
-            nc->subscribe(true,[](NimBLERemoteCharacteristic*,uint8_t*,size_t,bool){});
-        connected=true;
-        logWrite("BLE connected!");
-        while(connected){vTaskDelay(1000/portTICK_PERIOD_MS);sendGpsData();}
-        logWrite("BLE lost.");
-        pWriteChr=nullptr;
-        NimBLEDevice::deleteClient(pClient); pClient=nullptr;
+
+        auto svc = pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
+        if (!svc) { pClient->disconnect(); NimBLEDevice::deleteClient(pClient); pClient = nullptr; continue; }
+
+        pWriteChr = svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
+        if (!pWriteChr) { pClient->disconnect(); NimBLEDevice::deleteClient(pClient); pClient = nullptr; continue; }
+
+        // Subscribe to notifications (camera status pushes)
+        auto nc = svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
+        if (nc && nc->canNotify())
+            nc->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t*, size_t, bool) {});
+
+        connected = true;
+        logWrite("BLE connected to camera");
+
+        // GPS injection loop — 1 Hz
+        while (connected) {
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            sendGpsData();
+        }
+
+        logWrite("BLE lost. Double tap to reconnect.");
+        pWriteChr = nullptr;
+        NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     }
     vTaskDelete(NULL);
 }
@@ -493,172 +694,196 @@ void bleTask(void* pvParameters) {
 // ═══════════════════════════════════════════════════════════
 // Setup
 // ═══════════════════════════════════════════════════════════
-void setup(){
+void setup() {
     Serial.begin(115200);
+
+    // instance.begin() initializes all hardware:
+    // display, GPS (UART1, 38400 baud), IMU, PMU, SD, touch, haptic
     instance.begin();
     beginLvglHelper(instance);
     instance.setBrightness(200);
-    startMs=millis();
-    lastActivityMs=millis();
+    startMs = millis();
+    lastActivityMs = millis();
 
-    if(instance.getDeviceProbe() & HW_BHI260AP_ONLINE){
+    // Enable accelerometer for shake-to-wake at 25 Hz
+    // Shake detection uses magnitude delta (not absolute) to avoid false triggers
+    if (instance.getDeviceProbe() & HW_BHI260AP_ONLINE) {
         accel.enable(25.0f, 0);
     }
 
-    sdReady=SD.exists("/");
+    sdReady = SD.exists("/");
     logWrite("=== TWatch-DJI START ===");
-    logWritef("SD: %s",sdReady?"OK":"NOT FOUND");
+    logWritef("SD: %s", sdReady ? "OK" : "NOT FOUND");
 
-    lv_obj_set_style_bg_color(lv_scr_act(),lv_color_black(),0);
-    lv_obj_set_style_bg_opa(lv_scr_act(),LV_OPA_COVER,0);
+    // ── LVGL UI setup ───────────────────────────────────────
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 
-    lblTime=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblTime,"--:--");
-    lv_obj_set_style_text_color(lblTime,lv_color_white(),0);
-    lv_obj_set_style_text_font(lblTime,&lv_font_montserrat_28,0);
-    lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,70,15);
+    // Time (top-left, 70px inset for rounded corner)
+    lblTime = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblTime, "--:--");
+    lv_obj_set_style_text_color(lblTime, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lblTime, &lv_font_montserrat_28, 0);
+    lv_obj_align(lblTime, LV_ALIGN_TOP_LEFT, 70, 15);
 
-    lblRec=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblRec,"●");
-    lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
-    lv_obj_set_style_text_font(lblRec,&lv_font_montserrat_28,0);
-    lv_obj_align(lblRec,LV_ALIGN_TOP_RIGHT,-90,15);
+    // REC indicator (top-right, 90px inset for rounded corner)
+    lblRec = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblRec, "●");
+    lv_obj_set_style_text_color(lblRec, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+    lv_obj_set_style_text_font(lblRec, &lv_font_montserrat_28, 0);
+    lv_obj_align(lblRec, LV_ALIGN_TOP_RIGHT, -90, 15);
 
-    lv_obj_t* l1=lv_label_create(lv_scr_act());
-    lv_label_set_text(l1,"────────────────");
-    lv_obj_set_style_text_color(l1,lv_palette_darken(LV_PALETTE_GREY,3),0);
-    lv_obj_set_style_text_font(l1,&lv_font_montserrat_14,0);
-    lv_obj_align(l1,LV_ALIGN_TOP_MID,0,55);
+    // Divider
+    lv_obj_t* l1 = lv_label_create(lv_scr_act());
+    lv_label_set_text(l1, "────────────────");
+    lv_obj_set_style_text_color(l1, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+    lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+    lv_obj_align(l1, LV_ALIGN_TOP_MID, 0, 55);
 
-    lblCoords=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblCoords,"GPS\nconnecting...");
-    lv_obj_set_style_text_color(lblCoords,lv_palette_main(LV_PALETTE_YELLOW),0);
-    lv_obj_set_style_text_font(lblCoords,&lv_font_montserrat_30,0);
-    lv_obj_set_style_text_align(lblCoords,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblCoords,390);
-    lv_obj_align(lblCoords,LV_ALIGN_TOP_MID,0,75);
+    // GPS coordinates
+    lblCoords = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblCoords, "GPS\nconnecting...");
+    lv_obj_set_style_text_color(lblCoords, lv_palette_main(LV_PALETTE_YELLOW), 0);
+    lv_obj_set_style_text_font(lblCoords, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_align(lblCoords, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lblCoords, 390);
+    lv_obj_align(lblCoords, LV_ALIGN_TOP_MID, 0, 75);
 
-    lv_obj_t* l2=lv_label_create(lv_scr_act());
-    lv_label_set_text(l2,"────────────────");
-    lv_obj_set_style_text_color(l2,lv_palette_darken(LV_PALETTE_GREY,3),0);
-    lv_obj_set_style_text_font(l2,&lv_font_montserrat_14,0);
-    lv_obj_align(l2,LV_ALIGN_TOP_MID,0,200);
+    // Divider
+    lv_obj_t* l2 = lv_label_create(lv_scr_act());
+    lv_label_set_text(l2, "────────────────");
+    lv_obj_set_style_text_color(l2, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+    lv_obj_set_style_text_font(l2, &lv_font_montserrat_14, 0);
+    lv_obj_align(l2, LV_ALIGN_TOP_MID, 0, 200);
 
-    lblSpeed=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblSpeed,"-- km/h   -- m");
-    lv_obj_set_style_text_color(lblSpeed,lv_palette_main(LV_PALETTE_CYAN),0);
-    lv_obj_set_style_text_font(lblSpeed,&lv_font_montserrat_26,0);
-    lv_obj_set_style_text_align(lblSpeed,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblSpeed,390);
-    lv_obj_align(lblSpeed,LV_ALIGN_TOP_MID,0,220);
+    // Speed + altitude
+    lblSpeed = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblSpeed, "-- km/h   -- m");
+    lv_obj_set_style_text_color(lblSpeed, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_text_font(lblSpeed, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_align(lblSpeed, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lblSpeed, 390);
+    lv_obj_align(lblSpeed, LV_ALIGN_TOP_MID, 0, 220);
 
-    lblCamSat=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblCamSat,"Cam: --   Sat: -");
-    lv_obj_set_style_text_color(lblCamSat,lv_palette_darken(LV_PALETTE_GREY,1),0);
-    lv_obj_set_style_text_font(lblCamSat,&lv_font_montserrat_20,0);
-    lv_obj_set_style_text_align(lblCamSat,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblCamSat,390);
-    lv_obj_align(lblCamSat,LV_ALIGN_TOP_MID,0,270);
+    // Camera status + satellites
+    lblCamSat = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblCamSat, "Cam: --   Sat: -");
+    lv_obj_set_style_text_color(lblCamSat, lv_palette_darken(LV_PALETTE_GREY, 1), 0);
+    lv_obj_set_style_text_font(lblCamSat, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(lblCamSat, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lblCamSat, 390);
+    lv_obj_align(lblCamSat, LV_ALIGN_TOP_MID, 0, 270);
 
-    lv_obj_t* zoneLine=lv_obj_create(lv_scr_act());
-    lv_obj_set_size(zoneLine,410,3);
-    lv_obj_set_style_bg_color(zoneLine,lv_palette_main(LV_PALETTE_BLUE_GREY),0);
-    lv_obj_set_style_bg_opa(zoneLine,LV_OPA_COVER,0);
-    lv_obj_set_style_border_width(zoneLine,0,0);
-    lv_obj_set_style_pad_all(zoneLine,0,0);
-    lv_obj_set_style_radius(zoneLine,0,0);
-    lv_obj_align(zoneLine,LV_ALIGN_TOP_MID,0,318);
+    // Zone separator — full width blue-grey line at y=318
+    lv_obj_t* zoneLine = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(zoneLine, 410, 3);
+    lv_obj_set_style_bg_color(zoneLine, lv_palette_main(LV_PALETTE_BLUE_GREY), 0);
+    lv_obj_set_style_bg_opa(zoneLine, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(zoneLine, 0, 0);
+    lv_obj_set_style_pad_all(zoneLine, 0, 0);
+    lv_obj_set_style_radius(zoneLine, 0, 0);
+    lv_obj_align(zoneLine, LV_ALIGN_TOP_MID, 0, 318);
 
-    lblLog=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblLog,"■ LOG: OFF");
-    lv_obj_set_style_text_color(lblLog,lv_palette_darken(LV_PALETTE_GREY,2),0);
-    lv_obj_set_style_text_font(lblLog,&lv_font_montserrat_28,0);
-    lv_obj_set_style_text_align(lblLog,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblLog,390);
-    lv_obj_align(lblLog,LV_ALIGN_TOP_MID,0,345);
+    // Logger status (lower zone)
+    lblLog = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblLog, "■ LOG: OFF");
+    lv_obj_set_style_text_color(lblLog, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+    lv_obj_set_style_text_font(lblLog, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_align(lblLog, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lblLog, 390);
+    lv_obj_align(lblLog, LV_ALIGN_TOP_MID, 0, 345);
 
-    lblBatSd=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblBatSd,"Bat: --%    SD: --");
-    lv_obj_set_style_text_color(lblBatSd,lv_palette_darken(LV_PALETTE_GREY,1),0);
-    lv_obj_set_style_text_font(lblBatSd,&lv_font_montserrat_20,0);
-    lv_obj_set_style_text_align(lblBatSd,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblBatSd,390);
-    lv_obj_align(lblBatSd,LV_ALIGN_TOP_MID,0,425);
+    // Battery + SD card (lower zone)
+    lblBatSd = lv_label_create(lv_scr_act());
+    lv_label_set_text(lblBatSd, "Bat: --%    SD: --");
+    lv_obj_set_style_text_color(lblBatSd, lv_palette_darken(LV_PALETTE_GREY, 1), 0);
+    lv_obj_set_style_text_font(lblBatSd, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(lblBatSd, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lblBatSd, 390);
+    lv_obj_align(lblBatSd, LV_ALIGN_TOP_MID, 0, 425);
 
-    xTaskCreate(bleTask,"ble",8192,NULL,1,NULL);
+    // Start BLE task on core 0 (Arduino loop runs on core 1)
+    xTaskCreate(bleTask, "ble", 8192, NULL, 1, NULL);
 }
 
 // ═══════════════════════════════════════════════════════════
-// Loop
+// Main Loop
+//
+// Key rule: instance.gps uses LilyGoLib GPS class (inherits TinyGPSPlus).
+// Never create HardwareSerial manually for GPS — LilyGoLib owns UART1.
+// instance.gps.loop() reads UART and parses NMEA in one call.
 // ═══════════════════════════════════════════════════════════
-void loop(){
-    instance.gps.loop();
-    instance.loop();
+void loop() {
+    instance.gps.loop();   // read GPS UART + parse NMEA sentences
+    instance.loop();       // process PMU/touch/sensor events, update LVGL timers
 
-// Гасить дисплей
-if(displayOn && millis()-lastActivityMs>DISPLAY_TIMEOUT_MS){
-    displayOn=false;
-    sleepStartMs=millis();
-    instance.setBrightness(0);
-}
-
-// Пробуждение по встряхиванию — только после 2 сек сна
-// Детектируем ИЗМЕНЕНИЕ ускорения, не абсолютное значение
-if(!displayOn && millis()-sleepStartMs>2000 && accel.hasUpdated()){
-    float x=accel.getX(), y=accel.getY(), z=accel.getZ();
-    float mag=sqrtf(x*x+y*y+z*z);
-    float delta=fabsf(mag-prevAccelMag);
-    prevAccelMag=mag;
-    if(delta>3.0f){
-        wakeDisplay();
-    }
-}
-
-    // Первый GPS фикс
-    if(!firstFix&&instance.gps.location.isValid()){
-        firstFix=true;
-        uint32_t t=(millis()-startMs)/1000;
-        logWritef("GPS fix: %.5f,%.5f %dsats %lus",
-            instance.gps.location.lat(),instance.gps.location.lng(),
-            (int)instance.gps.satellites.value(),t);
-        gpxCheckDay();
+    // ── Display sleep timeout ────────────────────────────────
+    if (displayOn && millis() - lastActivityMs > DISPLAY_TIMEOUT_MS) {
+        displayOn = false;
+        sleepStartMs = millis();
+        instance.setBrightness(0);
+        logWrite("Display sleep");
     }
 
-    // UI каждые 2 сек
-    if(millis()-lastUiUpdate>2000){
-        lastUiUpdate=millis();
+    // ── Shake-to-wake (BHI260AP accelerometer) ───────────────
+    // 2-second cooldown after sleep prevents immediate re-trigger.
+    // Threshold of 3.0 is ~3x the noise floor (observed ~1.0 at rest).
+    if (!displayOn && millis() - sleepStartMs > 2000 && accel.hasUpdated()) {
+        float x = accel.getX(), y = accel.getY(), z = accel.getZ();
+        float mag = sqrtf(x*x + y*y + z*z);
+        float delta = fabsf(mag - prevAccelMag);
+        prevAccelMag = mag;
+        if (delta > 3.0f) {
+            wakeDisplay();
+            logWrite("Wake by shake");
+        }
+    }
+
+    // ── GPS: first fix ───────────────────────────────────────
+    if (!firstFix && instance.gps.location.isValid()) {
+        firstFix = true;
+        uint32_t fixTime = (millis() - startMs) / 1000;
+        logWritef("GPS first fix: %.5f,%.5f %d sats, %lu sec",
+            instance.gps.location.lat(), instance.gps.location.lng(),
+            (int)instance.gps.satellites.value(), fixTime);
+        gpxCheckDay();  // create today's GPX file now that we have a date
+    }
+
+    // ── UI refresh every 2 seconds ───────────────────────────
+    if (millis() - lastUiUpdate > 2000) {
+        lastUiUpdate = millis();
         updateUI();
     }
 
-    // GPX трекпоинт
-    if(gpxLogging&&millis()-lastTrackMs>TRACK_INTERVAL_MS){
-        lastTrackMs=millis();
+    // ── GPX track point every minute (only when logger is ON) ─
+    if (gpxLogging && millis() - lastTrackMs > TRACK_INTERVAL_MS) {
+        lastTrackMs = millis();
         gpxCheckDay();
         gpxWriteTrackPoint();
     }
 
-    // Батарея каждые 30 мин
-    if(millis()-lastBatLogMs>BAT_LOG_INTERVAL_MS){
-        lastBatLogMs=millis();
-        logWritef("Battery: %d%%",instance.pmu.getBatteryPercent());
+    // ── Battery log every 30 minutes ─────────────────────────
+    if (millis() - lastBatLogMs > BAT_LOG_INTERVAL_MS) {
+        lastBatLogMs = millis();
+        logWritef("Battery: %d%%", instance.pmu.getBatteryPercent());
     }
 
-    // Обработка касания
-    bool isTouched=instance.getTouched();
-    if(isTouched&&!touchActive){
-        touchActive=true;
-        touchStartMs=millis();
-        instance.getPoint(&touchX,&touchY);
+    // ── Touch handling ───────────────────────────────────────
+    // Process on release (touchActive → false) to measure hold duration.
+    // Any touch wakes the display; action only fires if display was already on.
+    bool isTouched = instance.getTouched();
+    if (isTouched && !touchActive) {
+        touchActive = true;
+        touchStartMs = millis();
+        instance.getPoint(&touchX, &touchY);
     }
-    if(!isTouched&&touchActive){
-        touchActive=false;
-        uint32_t dur=millis()-touchStartMs;
-        wakeDisplay();  // будим только при завершении тапа
-        if(displayOn){
-            handleTouchEnd(touchX,touchY,dur);
-        }
+    if (!isTouched && touchActive) {
+        touchActive = false;
+        uint32_t dur = millis() - touchStartMs;
+        wakeDisplay();
+        if (displayOn) handleTouchEnd(touchX, touchY, dur);
     }
 
-    lv_task_handler();
+    lv_task_handler();  // process LVGL drawing queue
     delay(5);
 }
